@@ -8,6 +8,30 @@ namespace CppClingo::Ground {
 
 class StmSortElem;
 
+//! State of an internally represented sort membership atom.
+struct SortMemberState {
+    std::optional<size_t> uid;
+    std::vector<size_t> supports;
+    bool fact = false;
+};
+
+//! Base storing sort memberships keyed by group and value.
+class BaseSortMember : public BaseImpl<std::tuple<size_t, Symbol>, BaseSortMember> {
+  public:
+    using BaseImpl::contains;
+    using Key = BaseImpl::Key;
+    using AtomSet = Util::ordered_map<Key, SortMemberState>;
+
+    [[nodiscard]] auto size() const -> size_t { return atoms_.size(); }
+    [[nodiscard]] auto index(Key const &key) const -> size_t { return atoms_.find(key) - atoms_.begin(); }
+    [[nodiscard]] auto nth(size_t index) const -> AtomSet::const_iterator { return atoms_.nth(index); }
+    auto nth(size_t index) -> AtomSet::iterator { return atoms_.nth(index); }
+    [[nodiscard]] auto atoms() -> AtomSet & { return atoms_; }
+
+  private:
+    AtomSet atoms_;
+};
+
 //! Base storing the derived adjacency relation for `#sort` literals.
 //!
 //! Values are partitioned by assignments to the global grouping variables.
@@ -53,9 +77,10 @@ class StateSort : public State {
     using GroupMap = BaseSort::GroupMap;
 
     //! Construct the state with global grouping variables and adjacency terms.
-    StateSort(std::pmr::monotonic_buffer_resource &mbr, VariableVec global, UTerm prev, UTerm next)
-        : base_{global.size()}, global_{std::move(global)}, prev_{std::move(prev)}, next_{std::move(next)}, mbr_{&mbr} {
-    }
+    StateSort(std::pmr::monotonic_buffer_resource &mbr, VariableVec global, UTerm prev, UTerm next,
+              size_t member_index = stratified_index)
+        : base_{global.size()}, global_{std::move(global)}, prev_{std::move(prev)}, next_{std::move(next)}, mbr_{&mbr},
+          member_index_{member_index} {}
 
     //! Get the global variables used to form grouping keys.
     [[nodiscard]] auto global() const -> VariableVec const &;
@@ -67,22 +92,97 @@ class StateSort : public State {
     [[nodiscard]] auto next() const -> Term const &;
     //! Access the propagated base.
     [[nodiscard]] auto base() -> BaseSort &;
+    [[nodiscard]] auto member_base() -> BaseSortMember & { return member_base_; }
+    [[nodiscard]] auto member_index() const -> size_t { return member_index_; }
+    auto insert_member(EvalContext const &ctx, Term const &term) -> BaseSortMember::AtomSet::iterator;
     //! Insert or find the group for the current global assignment.
     auto insert_group(EvalContext const &ctx) -> std::pair<GroupMap::iterator, bool>;
     //! Evaluate and append one value to a group's raw value list.
     void insert_value(EvalContext const &ctx, GroupMap::iterator group, Term const &term);
     //! Finalize a group by deriving adjacency atoms from sorted unique values.
     void propagate(GroupMap::iterator group);
-    void output(Logger &, SymbolStore &, OutputStm &) override {}
+    void output(Logger &, SymbolStore &, OutputStm &out) override;
 
   private:
     BaseSort base_;
+    BaseSortMember member_base_;
     VariableVec global_;
     SymbolVec symbols_;
     UTerm prev_;
     UTerm next_;
     std::pmr::monotonic_buffer_resource *mbr_;
+    size_t member_index_;
     GroupKey *group_key_ = nullptr;
+};
+
+//! Matcher for internally represented sort membership atoms.
+class MatchSortMember {
+  public:
+    using Key = BaseSortMember::Key;
+    MatchSortMember(StateSort &state, UTerm value) : state_{&state}, value_{std::move(value)} {}
+    MatchSortMember(MatchSortMember const &other) : state_{other.state_}, value_{other.value_->copy()} {}
+
+    [[nodiscard]] auto vars() const -> VariableSet;
+    [[nodiscard]] auto signature(VariableSet const &bound, VariableSet const &bind) const -> VariableVec;
+    [[nodiscard]] auto match(EvalContext const &ctx, Key const &key) const -> bool;
+    [[nodiscard]] auto eval(EvalContext const &ctx) const -> std::optional<Key>;
+    [[nodiscard]] auto state() const -> StateSort & { return *state_; }
+    [[nodiscard]] auto value() const -> Term const & { return *value_; }
+    friend auto operator<<(std::ostream &out, MatchSortMember const &match) -> std::ostream &;
+
+  private:
+    StateSort *state_;
+    UTerm value_;
+};
+
+//! Literal matching an internally represented sort membership atom.
+class LitSortMember : public Lit, private MatchSortMember {
+  public:
+    LitSortMember(StateSort &state, UTerm value) : MatchSortMember{state, std::move(value)} {}
+
+  private:
+    void do_vars(VariableSet &vars, VarSelectMode mode) const override;
+    [[nodiscard]] auto do_domain() const -> bool override { return false; }
+    [[nodiscard]] auto do_single_pass() const -> bool override { return state().member_index() == stratified_index; }
+    auto do_matcher(std::pmr::monotonic_buffer_resource &mbr, MatcherType type, std::vector<bool> const &bound)
+        -> std::pair<UMatcher, std::optional<size_t>> override;
+    [[nodiscard]] auto do_score(std::vector<bool> const &bound) const -> double override;
+    void do_print(std::ostream &out) const override;
+    auto do_output(EvalContext const &ctx, OutputLit &out) const -> bool override;
+    [[nodiscard]] auto do_copy() const -> ULit override;
+    [[nodiscard]] auto do_hash() const -> size_t override;
+    [[nodiscard]] auto do_equal_to(Lit const &other) const -> bool override;
+    [[nodiscard]] auto do_compare_to(Lit const &other) const -> std::weak_ordering override;
+
+    size_t offset_ = 0;
+};
+
+//! Statement accumulating a supported sort membership atom.
+class StmSortMember : public Stm {
+  public:
+    StmSortMember(StateSort &state, UTerm value, ULitVec body, size_t num_cond, size_t priority,
+                  ProfileNodeInternal *node)
+        : state_{&state}, value_{std::move(value)}, body_{std::move(body)}, num_cond_{num_cond}, priority_{priority},
+          node_{node} {}
+
+  private:
+    auto do_body() const -> ULitVec const & override { return body_; }
+    auto do_important() const -> VariableSet override;
+    auto do_is_important(size_t index) const -> bool override { return index < num_cond_; }
+    void do_init(size_t gen) override;
+    auto do_report(EvalContext const &ctx) -> bool override;
+    void do_propagate(SymbolStore &, OutputStm &, Queue &queue) override;
+    auto do_priority() const -> size_t override { return priority_; }
+    void do_print_head(std::ostream &out) const override;
+    void do_print(std::ostream &out) const override;
+    [[nodiscard]] auto do_profile_node() const -> ProfileNodeInternal * override { return node_; }
+
+    StateSort *state_;
+    UTerm value_;
+    ULitVec body_;
+    size_t num_cond_;
+    size_t priority_;
+    ProfileNodeInternal *node_;
 };
 
 //! Matcher helper for `#sort` literals.

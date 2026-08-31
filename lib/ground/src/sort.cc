@@ -2,6 +2,8 @@
 
 #include <clingo/util/print.hh>
 
+#include <typeindex>
+
 namespace CppClingo::Ground {
 
 auto BaseSort::size() const -> size_t {
@@ -67,6 +69,12 @@ auto StateSort::next() const -> Term const & {
 auto StateSort::base() -> BaseSort & {
     return base_;
 }
+auto StateSort::insert_member(EvalContext const &ctx, Term const &term) -> BaseSortMember::AtomSet::iterator {
+    auto group = insert_group(ctx).first;
+    auto value = term.eval(ctx);
+    assert(value.has_value());
+    return member_base_.atoms().try_emplace({group - base_.groups().begin(), *value}).first;
+}
 auto StateSort::insert_group(EvalContext const &ctx) -> std::pair<GroupMap::iterator, bool> {
     GroupKey::construct(*mbr_, ctx.ass(), global_, group_key_);
     auto [it, inserted] = base_.groups().try_emplace(group_key_->symbols());
@@ -92,6 +100,146 @@ void StateSort::propagate(GroupMap::iterator group) {
     for (auto next = std::next(prev); next != values.end(); ++prev, ++next) {
         base_.atoms().try_emplace({group_index, *prev, *next}, invalid_offset);
     }
+}
+void StateSort::output(Logger &, SymbolStore &store, OutputStm &out) {
+    for (size_t index = 0; index < member_base_.size(); ++index) {
+        auto &atom = member_base_.nth(index).value();
+        if (atom.fact) {
+            atom.uid = out.uid(true);
+            continue;
+        }
+        if (!atom.uid.has_value()) {
+            atom.uid = out.uid();
+        }
+        auto elems = std::vector<OutputStm::BdElem>{};
+        elems.reserve(atom.supports.size());
+        auto tuple = std::array{store.num_ref(1)};
+        for (auto const &support : atom.supports) {
+            elems.emplace_back(tuple, IndexSpan{&support, 1});
+        }
+        auto guards = std::array{OutputStm::Guard{Relation::greater_equal, store.num_ref(1)}};
+        out.bd_aggr(*atom.uid, AggregateFunction::sum, elems, guards);
+    }
+}
+
+auto MatchSortMember::vars() const -> VariableSet {
+    auto vars = VariableSet{state_->global().begin(), state_->global().end()};
+    value_->vars(vars);
+    return vars;
+}
+auto MatchSortMember::signature(VariableSet const &bound, VariableSet const &) const -> VariableVec {
+    return {bound.begin(), bound.end()};
+}
+auto MatchSortMember::match(EvalContext const &ctx, Key const &key) const -> bool {
+    auto const *symbol = state_->base().groups().nth(std::get<0>(key)).key();
+    for (auto var : state_->global()) {
+        if (auto &assigned = ctx.ass()[var]; assigned) {
+            if (*assigned != *symbol) {
+                return false;
+            }
+        } else {
+            assigned = *symbol;
+        }
+        ++symbol;
+    }
+    return value_->match(ctx, std::get<1>(key));
+}
+auto MatchSortMember::eval(EvalContext const &ctx) const -> std::optional<Key> {
+    auto globals = SymbolVec{};
+    for (auto var : state_->global()) {
+        globals.emplace_back(ctx.ass()[var].value());
+    }
+    auto group = state_->base().groups().find(globals.data());
+    auto value = value_->eval(ctx);
+    if (group == state_->base().groups().end() || !value) {
+        return std::nullopt;
+    }
+    return Key{group - state_->base().groups().begin(), *value};
+}
+auto operator<<(std::ostream &out, MatchSortMember const &match) -> std::ostream & {
+    return out << "#sort_member(" << match.value() << ")";
+}
+
+void LitSortMember::do_vars(VariableSet &vars, VarSelectMode mode) const {
+    if (mode != VarSelectMode::provide) {
+        vars.insert(state().global().begin(), state().global().end());
+    }
+    if (mode != VarSelectMode::depend) {
+        value().vars(vars);
+    }
+}
+auto LitSortMember::do_matcher(std::pmr::monotonic_buffer_resource &mbr, MatcherType type,
+                               std::vector<bool> const &bound) -> std::pair<UMatcher, std::optional<size_t>> {
+    auto index = type == MatcherType::new_atoms ? std::make_optional(state().member_index()) : std::nullopt;
+    return {make_atom_matcher(mbr, bound, state().member_base(), static_cast<MatchSortMember &>(*this), type, offset_),
+            index};
+}
+auto LitSortMember::do_score(std::vector<bool> const &) const -> double {
+    return 1;
+}
+void LitSortMember::do_print(std::ostream &out) const {
+    out << "#sort_member(" << value() << ")";
+}
+auto LitSortMember::do_output(EvalContext const &ctx, OutputLit &out) const -> bool {
+    auto key = eval(ctx);
+    assert(key.has_value());
+    auto &atom = state().member_base().atoms().find(*key).value();
+    if (atom.fact) {
+        return false;
+    }
+    atom.uid = out.bd_aggr(Sign::none, atom.uid);
+    return true;
+}
+auto LitSortMember::do_copy() const -> ULit {
+    return std::make_unique<LitSortMember>(state(), value().copy());
+}
+auto LitSortMember::do_hash() const -> size_t {
+    return Util::value_hash_record<LitSortMember>(reinterpret_cast<uintptr_t>(&state()), value());
+}
+auto LitSortMember::do_equal_to(Lit const &other) const -> bool {
+    auto const *member = dynamic_cast<LitSortMember const *>(&other);
+    return member != nullptr && &state() == &member->state() && value() == member->value();
+}
+auto LitSortMember::do_compare_to(Lit const &other) const -> std::weak_ordering {
+    if (auto const *member = dynamic_cast<LitSortMember const *>(&other); member != nullptr) {
+        return std::make_tuple(&state(), std::cref(value())) <=>
+               std::make_tuple(&member->state(), std::cref(member->value()));
+    }
+    return std::type_index(typeid(*this)) <=> std::type_index(typeid(other));
+}
+
+auto StmSortMember::do_important() const -> VariableSet {
+    auto vars = VariableSet{state_->global().begin(), state_->global().end()};
+    value_->vars(vars);
+    return vars;
+}
+void StmSortMember::do_init(size_t gen) {
+    state_->member_base().ensure(gen);
+}
+auto StmSortMember::do_report(EvalContext const &ctx) -> bool {
+    auto atom = state_->insert_member(ctx, *value_);
+    auto fact = true;
+    for (auto const &lit : std::span{body_}.first(num_cond_)) {
+        if (lit->output(ctx, ctx.out().cond())) {
+            fact = false;
+        }
+    }
+    atom.value().supports.emplace_back(ctx.out().cond_id());
+    atom.value().fact = atom.value().fact || fact;
+    return true;
+}
+void StmSortMember::do_propagate(SymbolStore &, OutputStm &, Queue &queue) {
+    if (state_->member_base().has_update() && state_->member_index() != stratified_index) {
+        queue.propagate(state_->member_index());
+    }
+}
+void StmSortMember::do_print_head(std::ostream &out) const {
+    out << "#sort_member(" << *value_ << ")";
+}
+void StmSortMember::do_print(std::ostream &out) const {
+    out << priority_ << ": ";
+    print_head(out);
+    out << " <- " << Util::p_range(body_, ", ", [](std::ostream &stream, auto const &lit) { stream << *lit; }) << ".";
 }
 
 auto MatchSort::vars() const -> VariableSet {
